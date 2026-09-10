@@ -21,6 +21,9 @@
   canvas{position:fixed;inset:0;display:block;z-index:0;touch-action:none}
   #ui{position:fixed;inset:0;z-index:2;pointer-events:none;font-family:'IBM Plex Mono',monospace;color:var(--ink)}
   #ui .btn,#ui .card{-webkit-tap-highlight-color:transparent}
+  #safeProbe{position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;
+    padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+    padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
 
   .screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
     opacity:0;visibility:hidden;pointer-events:none;cursor:default;text-align:center;
@@ -138,7 +141,7 @@
   #goBest{font-size:10px;letter-spacing:.3em;color:var(--gold);text-transform:uppercase;margin-bottom:30px}
   .go-actions{display:flex;gap:14px;margin-top:26px;flex-wrap:wrap;justify-content:center}
 
-  /* ===== MOBILE: dicas por dispositivo e ajustes de tela pequena ===== */
+  /* ===== MOBILE ===== */
   body.touch .mouse-only{display:none}
   body:not(.touch) .touch-only{display:none}
   body.touch .lv-hint{display:none}
@@ -168,6 +171,7 @@
 </head>
 <body>
 <canvas id="cv"></canvas>
+<div id="safeProbe"></div>
 
 <div id="ui">
   <!-- HUD -->
@@ -255,7 +259,7 @@
    MAPA DO CÓDIGO:
    01 · CONFIG     — todo o balanceamento num só lugar
    02 · SPRITES    — TROQUE OS SPRITES AQUI (1 linha)
-   03 · UTILS      — helpers matemáticos + canvas
+   03 · UTILS      — helpers matemáticos + canvas + zoom/câmera
    04 · AUDIO      — sons sintetizados (WebAudio)
    05 · STATE      — estado global + joysticks virtuais
    06 · UPGRADES   — 12 bênçãos + 4 relíquias de chefe
@@ -285,6 +289,9 @@ const CFG = {
   bossDelay: 3,
   // coleta
   magnetRadius: 110,
+  // câmera / zoom — valores < 1 = mais zoom out (vê mais do mundo)
+  zoomDesktop: .85,
+  zoomMobile:  .72,
   // atmosfera
   ashCount: 44
 };
@@ -293,6 +300,8 @@ const xpFor = l => Math.floor(CFG.xpBase + (l - 1) * CFG.xpLinear + Math.pow(l -
 // --- detecção de celular/tablet (MOBILE reduz a carga p/ manter 60fps) ---
 const MOBILE   = matchMedia('(pointer: coarse)').matches;
 const IS_TOUCH = MOBILE || navigator.maxTouchPoints > 0;
+const HAS_FINE_POINTER = matchMedia('(pointer: fine)').matches; // existe mouse/trackpad como ponteiro primário?
+const ZOOM = MOBILE ? CFG.zoomMobile : CFG.zoomDesktop;
 if (MOBILE){ CFG.maxEnemies = 90; CFG.ashCount = 26; }
 if (IS_TOUCH) document.body.classList.add('touch');
 
@@ -318,12 +327,26 @@ for (const name of ['player', 'grunt', 'brute', 'wisp', 'boss']){
 }
 
 /* ================================================================
-   03 · UTILS
+   03 · UTILS — canvas, zoom e safe areas
    ================================================================ */
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 let W = 0, H = 0, DPR = 1;
-function resize(){ DPR = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : 2); W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR; }
+let VW = 0, VH = 0;                 // tamanho da ÁREA VISÍVEL DO MUNDO (já com zoom aplicado)
+const SAFE = { t:0, r:0, b:0, l:0 }; // margens de segurança (notch/barra do iPhone)
+const safeProbe = document.getElementById('safeProbe');
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : 2);
+  W = innerWidth; H = innerHeight;
+  VW = W / ZOOM; VH = H / ZOOM;
+  cv.width = W * DPR; cv.height = H * DPR;
+  const cs = getComputedStyle(safeProbe);
+  SAFE.t = parseFloat(cs.paddingTop)    || 0;
+  SAFE.r = parseFloat(cs.paddingRight)  || 0;
+  SAFE.b = parseFloat(cs.paddingBottom) || 0;
+  SAFE.l = parseFloat(cs.paddingLeft)   || 0;
+}
 addEventListener('resize', resize); resize();
 if (window.visualViewport) visualViewport.addEventListener('resize', resize); // barra de endereço do celular
 
@@ -337,6 +360,9 @@ function shuffle(a){ for (let i = a.length - 1; i > 0; i--){ const j = (Math.ran
 function hash2(x, y){ let n = (x * 374761393 + y * 668265263) | 0; n = Math.imul(n ^ (n >>> 13), 1274126177); n ^= n >>> 16; return (n >>> 0) / 4294967296; }
 const fmt = s => { s |= 0; return String((s / 60) | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
 const $ = id => document.getElementById(id);
+// converte coordenada do MUNDO → pixel da TELA
+const scrX = x => (x - cam.x) * ZOOM + W / 2;
+const scrY = y => (y - cam.y) * ZOOM + H / 2;
 
 /* ================================================================
    04 · AUDIO — tudo sintetizado, sem arquivos
@@ -391,16 +417,16 @@ const G = { screen:'menu', t:0, gt:0, time:0, kills:0, wave:0,
 const P = { x:0, y:0, r:CFG.playerRadius, hp:CFG.playerHp, maxHp:CFG.playerHp,
             speed:CFG.playerSpeed, aim:0, fireCd:.4, ifr:0, shots:0,
             moving:false, bobT:0, dmgMul:1, rateMul:1, muzzle:0 };
-const cam = { x:0, y:0 };
+const cam = { x:0, y:0 };   // câmera TRAVADA no jogador (sem suavização = sempre centrado)
 const ch = { kick:0 };
 const mouse = { x:innerWidth / 2, y:innerHeight / 2, seen:false };
 const keys = {};
 
 // --- joysticks virtuais (mobile) ---
-const JOY_R = 56;                              // raio máximo do joystick
+const JOY_R = 56;
 const stickL = { id:null, ox:0, oy:0, dx:0, dy:0 };  // esquerda: mover
 const stickR = { id:null, ox:0, oy:0, dx:0, dy:0 };  // direita: mirar
-const EMPTY_SET = new Set();                   // reutilizado pela auto-mira
+const EMPTY_SET = new Set();
 function releaseSticks(){ stickL.id = stickR.id = null; stickL.dx = stickL.dy = stickR.dx = stickR.dy = 0; }
 
 let enemies = [], bullets = [], gems = [], parts = [], dnums = [], pendingShots = [];
@@ -535,7 +561,8 @@ const ETYPES = {
 
 function spawnEnemy(type, force){
   if (!force && enemies.length >= CFG.maxEnemies) return null;
-  const t = ETYPES[type], a = rnd(TAU), R = Math.hypot(W, H) * .5 + rnd(60, 170);
+  // raio de spawn considera o zoom: nasce sempre FORA da área visível
+  const t = ETYPES[type], a = rnd(TAU), R = Math.hypot(VW, VH) * .5 + rnd(60, 170);
   const e = { type, x:P.x + Math.cos(a) * R, y:P.y + Math.sin(a) * R, r:t.r,
     hp:t.hp(G.wave), maxHp:t.hp(G.wave), spd:t.spd(G.wave) * rnd(.92, 1.08),
     dmg:t.dmg, xp:t.xp, flash:0, kx:0, ky:0, ph:rnd(TAU), wob:rnd(TAU),
@@ -627,8 +654,8 @@ function update(dt){
   P.moving = false;
   if (stickL.id !== null){
     const m = Math.hypot(stickL.dx, stickL.dy);
-    if (m > JOY_R * .22){                      // zona morta
-      const k = Math.min(1, m / JOY_R);        // analógico: longe do centro = mais rápido
+    if (m > JOY_R * .22){
+      const k = Math.min(1, m / JOY_R);
       P.x += stickL.dx / m * k * P.speed * dt;
       P.y += stickL.dy / m * k * P.speed * dt;
       P.bobT += dt; P.moving = true;
@@ -643,14 +670,16 @@ function update(dt){
     }
   }
 
-  // --- mira: joystick direito > mouse > auto-mira no inimigo mais próximo ---
+  // --- mira: joystick direito > mouse > auto-mira ---
   if (stickR.id !== null && Math.hypot(stickR.dx, stickR.dy) > JOY_R * .25){
     P.aim = Math.atan2(stickR.dy, stickR.dx);
   } else if (!mouse.seen){
     const t = nearestEnemy(P.x, P.y, EMPTY_SET, 560);
     if (t) P.aim = Math.atan2(t.y - P.y, t.x - P.x);
   } else {
-    const wx = mouse.x - W / 2 + cam.x, wy = mouse.y - H / 2 + cam.y;
+    // converte a posição do mouse (tela) para o mundo DESCONSIDERANDO o zoom
+    const wx = cam.x + (mouse.x - W / 2) / ZOOM;
+    const wy = cam.y + (mouse.y - H / 2) / ZOOM;
     P.aim = Math.atan2(wy - P.y, wx - P.x);
   }
 
@@ -815,9 +844,8 @@ function update(dt){
     if (waveState.between <= 0) nextWave();
   }
 
-  // câmera + tremor
-  const k = 1 - Math.pow(.001, dt);
-  cam.x = lerp(cam.x, P.x, k); cam.y = lerp(cam.y, P.y, k);
+  // câmera TRAVADA no jogador — sempre no centro exato da tela
+  cam.x = P.x; cam.y = P.y;
   G.shake *= Math.exp(-6 * dt);
   G.flashHurt = Math.max(0, G.flashHurt - dt * 2.2);
 
@@ -827,9 +855,9 @@ function update(dt){
 function updateAmbient(dt){
   for (const a of ash){
     a.y -= a.v * dt; a.x += Math.sin(G.t * .6 + a.ph) * 9 * dt;
-    const lx = cam.x - W / 2 - 50, ly = cam.y - H / 2 - 50;
-    if (a.x < lx) a.x += W + 100; if (a.x > lx + W + 100) a.x -= W + 100;
-    if (a.y < ly) a.y += H + 100; if (a.y > ly + H + 100) a.y -= H + 100;
+    const lx = cam.x - VW / 2 - 60, ly = cam.y - VH / 2 - 60;
+    if (a.x < lx) a.x += VW + 120; if (a.x > lx + VW + 120) a.x -= VW + 120;
+    if (a.y < ly) a.y += VH + 120; if (a.y > ly + VH + 120) a.y -= VH + 120;
   }
 }
 
@@ -837,15 +865,15 @@ function updateAmbient(dt){
    10 · RENDER
    ================================================================ */
 function drawGround(){
-  const x0 = cam.x - W / 2, y0 = cam.y - H / 2;
+  const x0 = cam.x - VW / 2, y0 = cam.y - VH / 2;
   ctx.strokeStyle = 'rgba(236,228,211,.045)'; ctx.lineWidth = 1; ctx.beginPath();
-  for (let gx = Math.floor(x0 / 90) * 90; gx <= x0 + W; gx += 90){ ctx.moveTo(gx, y0); ctx.lineTo(gx, y0 + H); }
-  for (let gy = Math.floor(y0 / 90) * 90; gy <= y0 + H; gy += 90){ ctx.moveTo(x0, gy); ctx.lineTo(x0 + W, gy); }
+  for (let gx = Math.floor(x0 / 90) * 90; gx <= x0 + VW; gx += 90){ ctx.moveTo(gx, y0); ctx.lineTo(gx, y0 + VH); }
+  for (let gy = Math.floor(y0 / 90) * 90; gy <= y0 + VH; gy += 90){ ctx.moveTo(x0, gy); ctx.lineTo(x0 + VW, gy); }
   ctx.stroke();
 
   const cs = 240;
-  const gx0 = Math.floor(x0 / cs) - 1, gx1 = Math.floor((x0 + W) / cs) + 1;
-  const gy0 = Math.floor(y0 / cs) - 1, gy1 = Math.floor((y0 + H) / cs) + 1;
+  const gx0 = Math.floor(x0 / cs) - 1, gx1 = Math.floor((x0 + VW) / cs) + 1;
+  const gy0 = Math.floor(y0 / cs) - 1, gy1 = Math.floor((y0 + VH) / cs) + 1;
   for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++){
     const h = hash2(gx, gy);
     const bx = gx * cs + cs * (.15 + .7 * hash2(gx + 31, gy));
@@ -1097,25 +1125,31 @@ function drawPlayer(){
   ctx.restore();
 }
 
-// --- joysticks virtuais na tela (só em telas de toque) ---
+// --- joysticks virtuais na tela (só em telas de toque), ancorados nas safe areas ---
 function drawTouchUI(){
   if (!IS_TOUCH || G.screen !== 'playing') return;
-  const rest = [{ x:104, y:H - 112 }, { x:W - 104, y:H - 112 }];
+  const rest = [
+    { x: SAFE.l + 30 + JOY_R,       y: H - SAFE.b - 30 - JOY_R },
+    { x: W - SAFE.r - 30 - JOY_R,   y: H - SAFE.b - 30 - JOY_R }
+  ];
   [stickL, stickR].forEach((s, i) => {
     const bx = s.id !== null ? s.ox : rest[i].x;
     const by = s.id !== null ? s.oy : rest[i].y;
     ctx.save();
     ctx.strokeStyle = '#ece4d3'; ctx.lineWidth = 1.5;
-    if (i === 1) ctx.setLineDash([5, 7]);       // mira é tracejado
-    ctx.globalAlpha = s.id !== null ? .45 : .14;
+    if (i === 1) ctx.setLineDash([5, 7]);
+    ctx.globalAlpha = s.id !== null ? .5 : .22;
     ctx.beginPath(); ctx.arc(bx, by, JOY_R, 0, TAU); ctx.stroke();
     ctx.setLineDash([]);
     if (s.id !== null){
       const m = Math.hypot(s.dx, s.dy) || 1, cl = Math.min(m, JOY_R);
       ctx.globalAlpha = .12; ctx.fillStyle = '#ece4d3';
       ctx.beginPath(); ctx.arc(bx, by, JOY_R, 0, TAU); ctx.fill();
-      ctx.globalAlpha = .8;
+      ctx.globalAlpha = .85;
       ctx.beginPath(); ctx.arc(bx + s.dx / m * cl, by + s.dy / m * cl, 13, 0, TAU); ctx.fill();
+    } else {
+      ctx.globalAlpha = .35; ctx.fillStyle = '#ece4d3';
+      ctx.beginPath(); ctx.arc(bx, by, 5, 0, TAU); ctx.fill();
     }
     ctx.restore();
   });
@@ -1125,9 +1159,13 @@ function draw(){
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = '#0f0c0d'; ctx.fillRect(0, 0, W, H);
 
-  const shx = rnd(-1, 1) * G.shake, shy = rnd(-1, 1) * G.shake;
+  // tremor em unidades de tela (dividido pelo zoom p/ manter a intensidade)
+  const shx = rnd(-1, 1) * G.shake / ZOOM, shy = rnd(-1, 1) * G.shake / ZOOM;
+
+  // ---- PASSO 1: mundo (com zoom) ----
+  ctx.setTransform(DPR * ZOOM, 0, 0, DPR * ZOOM, 0, 0);
   ctx.save();
-  ctx.translate(W / 2 - cam.x + shx, H / 2 - cam.y + shy);
+  ctx.translate(VW / 2 - cam.x + shx, VH / 2 - cam.y + shy);
 
   drawGround();
   drawAsh();
@@ -1160,17 +1198,18 @@ function draw(){
   ctx.textAlign = 'center';
   for (const d of dnums){
     ctx.globalAlpha = clamp(d.life / .7, 0, 1);
-    ctx.font = `700 ${Math.round(13 * (d.size || 1))}px "IBM Plex Mono", monospace`;
-    ctx.strokeStyle = 'rgba(15,12,13,.8)'; ctx.lineWidth = 3; ctx.strokeText(d.v, d.x, d.y);
+    ctx.font = `700 ${Math.round(13 / ZOOM * (d.size || 1))}px "IBM Plex Mono", monospace`;
+    ctx.strokeStyle = 'rgba(15,12,13,.8)'; ctx.lineWidth = 3 / ZOOM; ctx.strokeText(d.v, d.x, d.y);
     ctx.fillStyle = d.col || '#f2e9d8'; ctx.fillText(d.v, d.x, d.y);
   }
   ctx.globalAlpha = 1;
   ctx.restore();
 
-  // luz + vinheta
+  // ---- PASSO 2: interface em espaço de tela (sem zoom) ----
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
   const inGame = G.screen !== 'menu';
-  const lx = inGame ? P.x - cam.x + W / 2 : W / 2;
-  const ly = inGame ? P.y - cam.y + H / 2 : H / 2;
+  const lx = scrX(P.x), ly = scrY(P.y);
   const flick = Math.sin(G.t * 1.7) * .03 + Math.sin(G.t * 4.3) * .02;
   const R = Math.max(W, H) * .78;
   let g = ctx.createRadialGradient(lx, ly, 150, lx, ly, R);
@@ -1194,7 +1233,7 @@ function draw(){
 
   drawTouchUI();
 
-  // mira: mouse (desktop) ou indicador de direção (toque)
+  // mira do mouse (desktop)
   if (G.screen === 'playing' && mouse.seen){
     const r = 9 + ch.kick * 5;
     ctx.strokeStyle = 'rgba(236,228,211,.9)'; ctx.lineWidth = 1.5;
@@ -1207,9 +1246,9 @@ function draw(){
     ctx.stroke();
     ctx.fillStyle = '#e05a4e';
     ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 1.6, 0, TAU); ctx.fill();
-  } else if (G.screen === 'playing' && !mouse.seen){
-    const rx = P.x - cam.x + W / 2 + Math.cos(P.aim) * 74;
-    const ry = P.y - cam.y + H / 2 + Math.sin(P.aim) * 74;
+  } else if (G.screen === 'playing' && !mouse.seen && inGame){
+    // indicador de direção da mira (toque / auto-mira)
+    const rx = lx + Math.cos(P.aim) * 74, ry = ly + Math.sin(P.aim) * 74;
     ctx.save(); ctx.translate(rx, ry); ctx.rotate(Math.PI / 4);
     ctx.strokeStyle = 'rgba(236,228,211,.55)'; ctx.lineWidth = 1.5;
     ctx.strokeRect(-5, -5, 10, 10);
@@ -1225,7 +1264,7 @@ function draw(){
 function setScreen(s){
   G.screen = s;
   document.body.classList.toggle('playing', s === 'playing');
-  if (s !== 'playing') releaseSticks();   // dedo levantou/aba mudou → solta os joysticks
+  if (s !== 'playing') releaseSticks();
 }
 function show(id){ $(id).classList.add('show'); }
 function hide(id){ $(id).classList.remove('show'); }
@@ -1353,7 +1392,10 @@ function gameOver(){
 /* ================================================================
    12 · INPUT — teclado, mouse e toque (joysticks virtuais)
    ================================================================ */
+// só aceita mouse se o aparelho TEM ponteiro fino — em celulares, toques
+// disparam "mousemove fantasma" que sequestrava a mira para uma direção morta
 addEventListener('mousemove', e => {
+  if (!HAS_FINE_POINTER) return;
   mouse.x = e.clientX; mouse.y = e.clientY; mouse.seen = true;
 });
 
@@ -1361,7 +1403,7 @@ addEventListener('mousemove', e => {
 cv.addEventListener('pointerdown', e => {
   if (e.pointerType === 'mouse' || G.screen !== 'playing') return;
   const s = e.clientX < W / 2 ? stickL : stickR;
-  if (s.id !== null) return;              // aquele joystick já tem dono
+  if (s.id !== null) return;
   s.id = e.pointerId; s.ox = e.clientX; s.oy = e.clientY; s.dx = 0; s.dy = 0;
 });
 addEventListener('pointermove', e => {
@@ -1397,7 +1439,7 @@ cv.addEventListener('contextmenu', e => e.preventDefault());
    13 · GAME FLOW — start, restart e loop principal
    ================================================================ */
 function startGame(){
-  initAudio();  // precisa de um gesto do usuário — o toque no botão já serve no celular
+  initAudio();
   enemies.length = 0; bullets.length = 0; gems.length = 0;
   parts.length = 0; dnums.length = 0; pendingShots.length = 0;
   Object.assign(G, { time:0, kills:0, wave:0, xp:0, level:1, xpNext:xpFor(1),
