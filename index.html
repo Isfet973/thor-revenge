@@ -18,7 +18,9 @@
   html,body{height:100%;overflow:hidden;background:var(--bg)}
   body{user-select:none;-webkit-user-select:none;overscroll-behavior:none;-webkit-touch-callout:none}
   body.playing{cursor:none}
-  canvas{position:fixed;inset:0;display:block;z-index:0;touch-action:none}
+  /* top/left fixos: o tamanho do canvas é 100% controlado pelo JS,
+     em sincronia exata com o buffer — nada de inset:0 esticando por conta própria */
+  canvas{position:fixed;top:0;left:0;display:block;z-index:0;touch-action:none}
   #ui{position:fixed;inset:0;z-index:2;pointer-events:none;font-family:'IBM Plex Mono',monospace;color:var(--ink)}
   #ui .btn,#ui .card{-webkit-tap-highlight-color:transparent}
   #safeProbe{position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;
@@ -259,7 +261,7 @@
    MAPA DO CÓDIGO:
    01 · CONFIG     — todo o balanceamento num só lugar
    02 · SPRITES    — TROQUE OS SPRITES AQUI (1 linha)
-   03 · UTILS      — helpers matemáticos + canvas + zoom/câmera
+   03 · UTILS      — canvas + detecção de resolução/zoom (DPI)
    04 · AUDIO      — sons sintetizados (WebAudio)
    05 · STATE      — estado global + joysticks virtuais
    06 · UPGRADES   — 12 bênçãos + 4 relíquias de chefe
@@ -289,9 +291,6 @@ const CFG = {
   bossDelay: 3,
   // coleta
   magnetRadius: 110,
-  // câmera / zoom — valores < 1 = mais zoom out (vê mais do mundo)
-  zoomDesktop: .85,
-  zoomMobile:  .72,
   // atmosfera
   ashCount: 44
 };
@@ -300,8 +299,7 @@ const xpFor = l => Math.floor(CFG.xpBase + (l - 1) * CFG.xpLinear + Math.pow(l -
 // --- detecção de celular/tablet (MOBILE reduz a carga p/ manter 60fps) ---
 const MOBILE   = matchMedia('(pointer: coarse)').matches;
 const IS_TOUCH = MOBILE || navigator.maxTouchPoints > 0;
-const HAS_FINE_POINTER = matchMedia('(pointer: fine)').matches; // existe mouse/trackpad como ponteiro primário?
-const ZOOM = MOBILE ? CFG.zoomMobile : CFG.zoomDesktop;
+const HAS_FINE_POINTER = matchMedia('(pointer: fine)').matches;
 if (MOBILE){ CFG.maxEnemies = 90; CFG.ashCount = 26; }
 if (IS_TOUCH) document.body.classList.add('touch');
 
@@ -327,28 +325,64 @@ for (const name of ['player', 'grunt', 'brute', 'wisp', 'boss']){
 }
 
 /* ================================================================
-   03 · UTILS — canvas, zoom e safe areas
+   03 · UTILS — canvas + detecção de resolução/zoom (DPI)
+   ----------------------------------------------------------------
+   Como o jogo "sabe" a resolução e o zoom:
+   - window.devicePixelRatio É o produto de todas as escalas:
+       resolução do monitor × escala do Windows (100%/125%/150%) × zoom do navegador.
+       Ex.: 1920px com Windows a 125% → DPR = 1.25 e a janela tem 1536px lógicos.
+   - window.visualViewport dá a área REALMENTE visível no celular
+       (desconta barra de endereço, notch, gesto home) — é ela que corrige a rotação.
+   - O canvas é redimensionado para W×DPR pixels reais (nítido em qualquer escala)
+       e o tamanho CSS é gravado por JS, para buffer e tela nunca divergirem.
+   - checkViewport() roda a cada frame: se QUALQUER coisa mudar no meio do jogo
+       (Ctrl+scroll, mudar escala do Windows, girar o celular, barra aparecer/some),
+       o canvas se re-ajusta sozinho no mesmo frame.
    ================================================================ */
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 let W = 0, H = 0, DPR = 1;
-let VW = 0, VH = 0;                 // tamanho da ÁREA VISÍVEL DO MUNDO (já com zoom aplicado)
-const SAFE = { t:0, r:0, b:0, l:0 }; // margens de segurança (notch/barra do iPhone)
-const safeProbe = document.getElementById('safeProbe');
 
-function resize(){
-  DPR = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : 2);
-  W = innerWidth; H = innerHeight;
-  VW = W / ZOOM; VH = H / ZOOM;
-  cv.width = W * DPR; cv.height = H * DPR;
-  const cs = getComputedStyle(safeProbe);
-  SAFE.t = parseFloat(cs.paddingTop)    || 0;
-  SAFE.r = parseFloat(cs.paddingRight)  || 0;
-  SAFE.b = parseFloat(cs.paddingBottom) || 0;
-  SAFE.l = parseFloat(cs.paddingLeft)   || 0;
+function measure(){
+  const vv = window.visualViewport;
+  return {
+    w: Math.round(vv ? vv.width  : innerWidth),
+    h: Math.round(vv ? vv.height : innerHeight),
+    dpr: window.devicePixelRatio || 1
+  };
 }
-addEventListener('resize', resize); resize();
-if (window.visualViewport) visualViewport.addEventListener('resize', resize); // barra de endereço do celular
+function resize(){
+  const m = measure();
+  if (m.w === W && m.h === H && m.dpr === DPR) return;   // nada mudou
+  W = m.w; H = m.h;
+  DPR = Math.min(3, Math.max(1, m.dpr));                 // teto de 3 = 4K/HiDPI sem explodir memória
+  cv.width  = Math.round(W * DPR);                       // buffer em pixels FÍSICOS reais
+  cv.height = Math.round(H * DPR);
+  cv.style.width  = W + 'px';                            // tamanho CSS sob controle do JS
+  cv.style.height = H + 'px';
+}
+resize();
+
+// zoom do navegador/SO mudou → devicePixelRatio muda → este "media query quebra"
+// e aí re-medimos e re-armamos o detector para o próximo valor
+function watchDpr(){
+  const mq = matchMedia(`(resolution: ${measure().dpr}dppx)`);
+  mq.addEventListener('change', () => { resize(); watchDpr(); });
+}
+watchDpr();
+
+addEventListener('resize', resize);
+addEventListener('orientationchange', () => { resize(); setTimeout(resize, 120); setTimeout(resize, 400); });
+if (window.visualViewport) visualViewport.addEventListener('resize', resize);
+if (screen.orientation && screen.orientation.addEventListener)
+  screen.orientation.addEventListener('change', () => setTimeout(resize, 120));
+
+// rede de segurança: conferência por frame (custa quase zero) — se algum evento
+// se perder no celular/WebView, o tamanho se corrige sozinho de qualquer forma
+function checkViewport(){
+  const m = measure();
+  if (m.w !== W || m.h !== H || Math.abs(m.dpr - DPR) > .001) resize();
+}
 
 const TAU = Math.PI * 2;
 const rnd  = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
@@ -360,9 +394,6 @@ function shuffle(a){ for (let i = a.length - 1; i > 0; i--){ const j = (Math.ran
 function hash2(x, y){ let n = (x * 374761393 + y * 668265263) | 0; n = Math.imul(n ^ (n >>> 13), 1274126177); n ^= n >>> 16; return (n >>> 0) / 4294967296; }
 const fmt = s => { s |= 0; return String((s / 60) | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
 const $ = id => document.getElementById(id);
-// converte coordenada do MUNDO → pixel da TELA
-const scrX = x => (x - cam.x) * ZOOM + W / 2;
-const scrY = y => (y - cam.y) * ZOOM + H / 2;
 
 /* ================================================================
    04 · AUDIO — tudo sintetizado, sem arquivos
@@ -417,7 +448,7 @@ const G = { screen:'menu', t:0, gt:0, time:0, kills:0, wave:0,
 const P = { x:0, y:0, r:CFG.playerRadius, hp:CFG.playerHp, maxHp:CFG.playerHp,
             speed:CFG.playerSpeed, aim:0, fireCd:.4, ifr:0, shots:0,
             moving:false, bobT:0, dmgMul:1, rateMul:1, muzzle:0 };
-const cam = { x:0, y:0 };   // câmera TRAVADA no jogador (sem suavização = sempre centrado)
+const cam = { x:0, y:0 };   // câmera — travada no jogador no update (centro exato)
 const ch = { kick:0 };
 const mouse = { x:innerWidth / 2, y:innerHeight / 2, seen:false };
 const keys = {};
@@ -561,8 +592,7 @@ const ETYPES = {
 
 function spawnEnemy(type, force){
   if (!force && enemies.length >= CFG.maxEnemies) return null;
-  // raio de spawn considera o zoom: nasce sempre FORA da área visível
-  const t = ETYPES[type], a = rnd(TAU), R = Math.hypot(VW, VH) * .5 + rnd(60, 170);
+  const t = ETYPES[type], a = rnd(TAU), R = Math.hypot(W, H) * .5 + rnd(60, 170);
   const e = { type, x:P.x + Math.cos(a) * R, y:P.y + Math.sin(a) * R, r:t.r,
     hp:t.hp(G.wave), maxHp:t.hp(G.wave), spd:t.spd(G.wave) * rnd(.92, 1.08),
     dmg:t.dmg, xp:t.xp, flash:0, kx:0, ky:0, ph:rnd(TAU), wob:rnd(TAU),
@@ -677,9 +707,7 @@ function update(dt){
     const t = nearestEnemy(P.x, P.y, EMPTY_SET, 560);
     if (t) P.aim = Math.atan2(t.y - P.y, t.x - P.x);
   } else {
-    // converte a posição do mouse (tela) para o mundo DESCONSIDERANDO o zoom
-    const wx = cam.x + (mouse.x - W / 2) / ZOOM;
-    const wy = cam.y + (mouse.y - H / 2) / ZOOM;
+    const wx = mouse.x - W / 2 + cam.x, wy = mouse.y - H / 2 + cam.y;
     P.aim = Math.atan2(wy - P.y, wx - P.x);
   }
 
@@ -844,7 +872,8 @@ function update(dt){
     if (waveState.between <= 0) nextWave();
   }
 
-  // câmera TRAVADA no jogador — sempre no centro exato da tela
+  // câmera TRAVADA no jogador — centro matemático exato da tela, em qualquer
+  // resolução/escala/zoom. Sem suavização = sem atraso = sempre centralizado.
   cam.x = P.x; cam.y = P.y;
   G.shake *= Math.exp(-6 * dt);
   G.flashHurt = Math.max(0, G.flashHurt - dt * 2.2);
@@ -855,9 +884,9 @@ function update(dt){
 function updateAmbient(dt){
   for (const a of ash){
     a.y -= a.v * dt; a.x += Math.sin(G.t * .6 + a.ph) * 9 * dt;
-    const lx = cam.x - VW / 2 - 60, ly = cam.y - VH / 2 - 60;
-    if (a.x < lx) a.x += VW + 120; if (a.x > lx + VW + 120) a.x -= VW + 120;
-    if (a.y < ly) a.y += VH + 120; if (a.y > ly + VH + 120) a.y -= VH + 120;
+    const lx = cam.x - W / 2 - 50, ly = cam.y - H / 2 - 50;
+    if (a.x < lx) a.x += W + 100; if (a.x > lx + W + 100) a.x -= W + 100;
+    if (a.y < ly) a.y += H + 100; if (a.y > ly + H + 100) a.y -= H + 100;
   }
 }
 
@@ -865,15 +894,15 @@ function updateAmbient(dt){
    10 · RENDER
    ================================================================ */
 function drawGround(){
-  const x0 = cam.x - VW / 2, y0 = cam.y - VH / 2;
+  const x0 = cam.x - W / 2, y0 = cam.y - H / 2;
   ctx.strokeStyle = 'rgba(236,228,211,.045)'; ctx.lineWidth = 1; ctx.beginPath();
-  for (let gx = Math.floor(x0 / 90) * 90; gx <= x0 + VW; gx += 90){ ctx.moveTo(gx, y0); ctx.lineTo(gx, y0 + VH); }
-  for (let gy = Math.floor(y0 / 90) * 90; gy <= y0 + VH; gy += 90){ ctx.moveTo(x0, gy); ctx.lineTo(x0 + VW, gy); }
+  for (let gx = Math.floor(x0 / 90) * 90; gx <= x0 + W; gx += 90){ ctx.moveTo(gx, y0); ctx.lineTo(gx, y0 + H); }
+  for (let gy = Math.floor(y0 / 90) * 90; gy <= y0 + H; gy += 90){ ctx.moveTo(x0, gy); ctx.lineTo(x0 + W, gy); }
   ctx.stroke();
 
   const cs = 240;
-  const gx0 = Math.floor(x0 / cs) - 1, gx1 = Math.floor((x0 + VW) / cs) + 1;
-  const gy0 = Math.floor(y0 / cs) - 1, gy1 = Math.floor((y0 + VH) / cs) + 1;
+  const gx0 = Math.floor(x0 / cs) - 1, gx1 = Math.floor((x0 + W) / cs) + 1;
+  const gy0 = Math.floor(y0 / cs) - 1, gy1 = Math.floor((y0 + H) / cs) + 1;
   for (let gy = gy0; gy <= gy1; gy++) for (let gx = gx0; gx <= gx1; gx++){
     const h = hash2(gx, gy);
     const bx = gx * cs + cs * (.15 + .7 * hash2(gx + 31, gy));
@@ -1156,16 +1185,16 @@ function drawTouchUI(){
 }
 
 function draw(){
+  // o transform sempre usa o DPR REAL medido — nítido em 100%, 125%, 150%...
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = '#0f0c0d'; ctx.fillRect(0, 0, W, H);
 
-  // tremor em unidades de tela (dividido pelo zoom p/ manter a intensidade)
-  const shx = rnd(-1, 1) * G.shake / ZOOM, shy = rnd(-1, 1) * G.shake / ZOOM;
+  const shx = rnd(-1, 1) * G.shake, shy = rnd(-1, 1) * G.shake;
 
-  // ---- PASSO 1: mundo (com zoom) ----
-  ctx.setTransform(DPR * ZOOM, 0, 0, DPR * ZOOM, 0, 0);
+  // o jogador está em cam.x/cam.y (câmera travada nele), então o translate
+  // W/2 - cam.x pousa ele EXATAMENTE no centro físico do canvas/tela
   ctx.save();
-  ctx.translate(VW / 2 - cam.x + shx, VH / 2 - cam.y + shy);
+  ctx.translate(W / 2 - cam.x + shx, H / 2 - cam.y + shy);
 
   drawGround();
   drawAsh();
@@ -1198,18 +1227,19 @@ function draw(){
   ctx.textAlign = 'center';
   for (const d of dnums){
     ctx.globalAlpha = clamp(d.life / .7, 0, 1);
-    ctx.font = `700 ${Math.round(13 / ZOOM * (d.size || 1))}px "IBM Plex Mono", monospace`;
-    ctx.strokeStyle = 'rgba(15,12,13,.8)'; ctx.lineWidth = 3 / ZOOM; ctx.strokeText(d.v, d.x, d.y);
+    ctx.font = '700 13px "IBM Plex Mono", monospace';
+    ctx.strokeStyle = 'rgba(15,12,13,.8)'; ctx.lineWidth = 3; ctx.strokeText(d.v, d.x, d.y);
     ctx.fillStyle = d.col || '#f2e9d8'; ctx.fillText(d.v, d.x, d.y);
   }
   ctx.globalAlpha = 1;
   ctx.restore();
 
-  // ---- PASSO 2: interface em espaço de tela (sem zoom) ----
+  // interface em espaço de tela (vinheta, luz, mira)
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
   const inGame = G.screen !== 'menu';
-  const lx = scrX(P.x), ly = scrY(P.y);
+  const lx = inGame ? W / 2 : W / 2;   // jogador está sempre no centro da tela
+  const ly = H / 2;
   const flick = Math.sin(G.t * 1.7) * .03 + Math.sin(G.t * 4.3) * .02;
   const R = Math.max(W, H) * .78;
   let g = ctx.createRadialGradient(lx, ly, 150, lx, ly, R);
@@ -1233,7 +1263,6 @@ function draw(){
 
   drawTouchUI();
 
-  // mira do mouse (desktop)
   if (G.screen === 'playing' && mouse.seen){
     const r = 9 + ch.kick * 5;
     ctx.strokeStyle = 'rgba(236,228,211,.9)'; ctx.lineWidth = 1.5;
@@ -1247,7 +1276,6 @@ function draw(){
     ctx.fillStyle = '#e05a4e';
     ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 1.6, 0, TAU); ctx.fill();
   } else if (G.screen === 'playing' && !mouse.seen && inGame){
-    // indicador de direção da mira (toque / auto-mira)
     const rx = lx + Math.cos(P.aim) * 74, ry = ly + Math.sin(P.aim) * 74;
     ctx.save(); ctx.translate(rx, ry); ctx.rotate(Math.PI / 4);
     ctx.strokeStyle = 'rgba(236,228,211,.55)'; ctx.lineWidth = 1.5;
@@ -1393,7 +1421,7 @@ function gameOver(){
    12 · INPUT — teclado, mouse e toque (joysticks virtuais)
    ================================================================ */
 // só aceita mouse se o aparelho TEM ponteiro fino — em celulares, toques
-// disparam "mousemove fantasma" que sequestrava a mira para uma direção morta
+// disparam "mousemove fantasma" que sequestrava a mira
 addEventListener('mousemove', e => {
   if (!HAS_FINE_POINTER) return;
   mouse.x = e.clientX; mouse.y = e.clientY; mouse.seen = true;
@@ -1451,6 +1479,7 @@ function startGame(){
   bossRef = null;
   releaseSticks();
   cam.x = 0; cam.y = 0;
+  resize();  // garante canvas correto se a janela mudou no menu
   waveState.active = false; waveState.between = CFG.firstWaveDelay;
   waveState.queue = []; waveState.bossDelay = 0;
   ['menu', 'gameover', 'levelup', 'pause'].forEach(hide);
@@ -1478,6 +1507,7 @@ let last = performance.now();
 function frame(now){
   const dt = Math.min((now - last) / 1000, .05); last = now;
   G.t += dt; ch.kick *= Math.exp(-12 * dt);
+  checkViewport();   // ← resolução/zoom/orientação certos a TODO frame, sem depender de eventos
   if (G.screen === 'playing') update(dt);
   else updateAmbient(dt);
   draw();
